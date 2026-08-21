@@ -14,7 +14,7 @@
 samp_by_grp <- function(samp, pop, dom_nm, B) {
   
   num_plots <- dplyr::count(samp, !!rlang::sym(dom_nm))
-  diff <- unique(pop$domain)[!unique(pop$domain) %in% unique(samp[[dom_nm]])]
+  diff <- unique(pop[[dom_nm]])[!unique(pop[[dom_nm]]) %in% unique(samp[[dom_nm]])]
   if (length(diff) != 0) {
     to_append <- data.frame(
       doms = diff,
@@ -23,9 +23,10 @@ samp_by_grp <- function(samp, pop, dom_nm, B) {
     colnames(to_append) <- c(dom_nm, "n")
     num_plots <- rbind(num_plots, to_append)
   }
-  
-  # our boot_pop_data has column name domain as its group variable
-  setup <- dplyr::count(pop, !!rlang::sym(dom_nm)) |> 
+
+  # domains with n = 0 (out-of-sample domains, i.e. present in pop but with
+  # no rows in samp) correctly draw 0 rows below instead of erroring
+  setup <- dplyr::count(pop, !!rlang::sym(dom_nm)) |>
     dplyr::left_join(num_plots, by = dom_nm) |>
     dplyr::mutate(add_to = dplyr::lag(cumsum(n.x), default = 0)) |>
     dplyr::rowwise() |> 
@@ -127,18 +128,34 @@ generate_mse <- function(.data,
                   design_mat_glm = dmat_glm))
     })
   
-  n_doms <- length(colnames(u_glm))
+  n_doms <- length(design_mat_ls)
   dom_order <- names(boot_pop_by_dom)
-  u_lm <- u_lm[, order(match(colnames(u_lm), dom_order))]
-  u_glm <- u_glm[, order(match(colnames(u_glm), dom_order))]
-  
-  if (ncol(u_lm) != ncol(u_glm)) {
-    diff <- base::setdiff(colnames(u_glm), colnames(u_lm))
-    to_append <- matrix(rep(NA, times = nrow(u_lm) * length(diff)), ncol = length(diff))
-    colnames(to_append) <- diff
-    u_lm <- cbind(u_lm, to_append)
+
+  # Align each random-effect matrix to have exactly one column per domain
+  # in dom_order, in that order (generate_preds()/preds_calc() indexes
+  # u_lm/u_glm by column position j, matched positionally to
+  # design_mats[[j]]). A domain can be entirely absent from u_lm (no
+  # replicate ever had a positive-response row for it) or from u_glm (no
+  # replicate ever had any row for it at all -- always true of
+  # out-of-sample domains, which contribute 0 rows to every bootstrap
+  # replicate); list_rbind() only unions the columns that did appear
+  # across replicates, so such a domain has no column yet, not just NA
+  # cells. Filling it with 0 gives a purely synthetic (population-average)
+  # domain effect for every replicate, consistent with how NA cells within
+  # an existing column are already zeroed before this function is called.
+  align_to_doms <- function(u_mat, dom_order) {
+    missing <- setdiff(dom_order, colnames(u_mat))
+    if (length(missing) > 0) {
+      to_append <- matrix(0, nrow = nrow(u_mat), ncol = length(missing),
+                          dimnames = list(NULL, missing))
+      u_mat <- cbind(u_mat, to_append)
+    }
+    u_mat[, dom_order, drop = FALSE]
   }
-  
+
+  u_lm <- align_to_doms(u_lm, dom_order)
+  u_glm <- align_to_doms(u_glm, dom_order)
+
   dom_res_wide <- generate_preds(beta_lm = beta_lm_mat,
                                  beta_glm = beta_glm_mat,
                                  u_lm = u_lm,
@@ -182,43 +199,50 @@ generate_boot_pop <- function(original_out,
                               transform_fun) {
   
   zi_mod_coefs <- mse_coefs(original_out$lmer, original_out$glmer)
-  
-  params_and_domain <- setNames(
-    zi_mod_coefs$b_i,
-    zi_mod_coefs$domain_levels
-  )
-  
-  pop_b_i <- data.frame(
-    dom = pop_dat[ , domain_level, drop = TRUE],
-    b_i = params_and_domain[pop_dat[ , domain_level, drop = TRUE]]
-  )
-  
-  pop_b_i[is.na(pop_b_i$b_i), "b_i"] <- 0
-  
+
   x_matrix <- model.matrix(
     as.formula(paste0(" ~ ", paste(all_preds, collapse = " + "))),
     data = pop_dat[ , all_preds, drop = FALSE]
   )
-  
+
   indv_re <- data.frame(
     dom = pop_dat[ , domain_level, drop = TRUE],
     eps_ij = rnorm(nrow(pop_dat), 0, sqrt(zi_mod_coefs$sig2_eps_hat))
   )
-  
-  # tweak for allowing new levels
+
+  # tweak for allowing new levels (also covers domains present in pop_dat
+  # but absent from the original sample, i.e. out-of-sample domains)
   pop_doms <- unique(pop_dat[[domain_level]])
-  all_doms <- unique(pop_doms, zi_mod_coefs$domain_levels)
-  
+  all_doms <- union(pop_doms, zi_mod_coefs$domain_levels)
+
   area_re_lkp <- setNames(
     rnorm(length(all_doms), 0, sqrt(zi_mod_coefs$sig2_mu_hat)),
     all_doms
   )
-  
+
   rand_effs <- data.frame(
     indv_re,
     u_j = area_re_lkp[pop_dat[ , domain_level, drop = TRUE]]
   )
-  
+
+  # Draw a fresh domain random effect for the logistic model from its
+  # estimated distribution N(0, sig2_b_hat), the same way u_j is drawn
+  # above for the linear model, rather than plugging in the original
+  # model's point-estimate BLUPs (which had no domain-level variance and
+  # were fixed at 0 for any domain outside the original sample). This is
+  # what lets the bootstrap "truth" population reflect the variability the
+  # logistic model actually contributes to the domain-level estimates,
+  # for in-sample and out-of-sample domains alike.
+  b_i_lkp <- setNames(
+    rnorm(length(all_doms), 0, sqrt(zi_mod_coefs$sig2_b_hat)),
+    all_doms
+  )
+
+  pop_b_i <- data.frame(
+    dom = pop_dat[ , domain_level, drop = TRUE],
+    b_i = b_i_lkp[pop_dat[ , domain_level, drop = TRUE]]
+  )
+
   x <- x_matrix[ , c("(Intercept)", log_X)] %*% zi_mod_coefs$alpha_1 + pop_b_i$b_i
   p_hat_i <- binomial()$linkinv(x)
   
@@ -311,7 +335,14 @@ boot_rep_par <- function(x,
   # sometimes u_lm will have fewer domains once it is filtered
   # down to positive response values
   u_lm[is.na(u_lm)] <- 0
-  
+
+  # domains that never appear in a given bootstrap replicate (this is
+  # always true of out-of-sample domains, which contribute 0 rows to every
+  # replicate) get no random-effect estimate from that replicate's glmer
+  # fit; treating that as a 0 random effect gives a purely synthetic
+  # (population-average) prediction for them, consistent with u_lm above
+  u_glm[is.na(u_glm)] <- 0
+
   preds_full <- generate_mse(.data = boot_pop_data,
                              truth = boot_truth,
                              domain_level = domain_level,
@@ -467,25 +498,31 @@ boot_rep <- function(boot_samp,
 #' @noRd
 #' 
 mse_coefs <- function(lmer_model, glmer_model) {
-  
+
   # from lmer model
   beta_hat <- lmer_model@beta # linear model coefficients
   model_summary_df <- data.frame(summary(lmer_model)$varcor)
-  
+
   sig2_mu_hat <- model_summary_df[1, ]$vcov
   sig2_eps_hat <- subset(model_summary_df, grp == "Residual")$vcov
-  
+
   # from glmer model
   alpha_1 <- glmer_model@beta
-  
+
+  # random-intercept variance of the logistic model, analogous to
+  # sig2_mu_hat above. glmer (binomial) fits have no residual variance
+  # component, so the domain random intercept is the first (only) row.
+  glm_summary_df <- data.frame(summary(glmer_model)$varcor)
+  sig2_b_hat <- glm_summary_df[1, ]$vcov
+
   b_i <- lme4::ranef(glmer_model)[[1]][,1]
   b_domain_levels <- rownames(lme4::ranef(glmer_model)[[1]])
-  
+
   return(list(
     beta_hat = beta_hat, sig2_mu_hat = sig2_mu_hat,
-    sig2_eps_hat = sig2_eps_hat, alpha_1 = alpha_1,
+    sig2_eps_hat = sig2_eps_hat, alpha_1 = alpha_1, sig2_b_hat = sig2_b_hat,
     b_i = b_i, domain_levels = b_domain_levels))
-  
+
 }
 
 #' A function factory that causes a function to capture messages, warnings, or errors 

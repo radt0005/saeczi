@@ -11,6 +11,13 @@
 #' @param parallel Logical. Should the MSE estimation be computed in parallel.
 #' @param transform_fun Function. Function to be applied to the response variable prior to modeling.
 #' @param inv_transform_fun Function. Inverse of transform_fun. Required if transform_fun is specified.
+#' @param predict_oos Logical. If pop_dat contains domains that have no rows in samp_dat
+#' (out-of-sample domains, i.e. domains with auxiliary data but no direct/sample data),
+#' should estimates (and MSE estimates, if mse_est = TRUE) be produced for them anyway?
+#' These are purely synthetic predictions: they use the fixed-effects portion of both
+#' models only, with no domain-specific random effect, since none can be estimated
+#' without sample data in the domain. Defaults to TRUE. If FALSE, such domains are
+#' dropped from the returned `res` data.frame entirely.
 #'
 #' @returns
 #' An object of class `zi_mod` with defined `print()` and `summary()` methods.
@@ -18,7 +25,10 @@
 #'
 #' * call: The original function call
 #'
-#' * res: A data.frame containing the estimates and mse estimates
+#' * res: A data.frame containing the estimates and mse estimates. Includes a logical
+#' `oos_flag` column that is TRUE for any domain whose estimate is purely synthetic,
+#' i.e. domains present in pop_dat with no rows in samp_dat (see `predict_oos`), and
+#' FALSE otherwise.
 #'
 #' * lin_mod: The modeling object used to fit the original linear model
 #'
@@ -55,7 +65,8 @@ saeczi <- function(samp_dat,
                    estimand = "means",
                    parallel = FALSE,
                    transform_fun = NULL,
-                   inv_transform_fun = NULL) {
+                   inv_transform_fun = NULL,
+                   predict_oos = TRUE) {
 
   funcCall <- match.call()
 
@@ -63,7 +74,7 @@ saeczi <- function(samp_dat,
   check_inherits("formula", lin_formula, log_formula)
   check_inherits("character", domain_level, estimand)
   check_inherits("integer", B)
-  check_inherits("logical", mse_est, parallel)
+  check_inherits("logical", mse_est, parallel, predict_oos)
   if (!is.null(transform_fun)) {
     if (is.null(inv_transform_fun)) {
       stop("inv_transform_fun must be specified when transform_fun is specified.")
@@ -81,6 +92,27 @@ saeczi <- function(samp_dat,
 
   if(!(estimand %in% c("means", "totals"))) {
     stop("Invalid estimand, must be either 'means' or 'totals'")
+  }
+
+  # domains with auxiliary data in pop_dat but no rows in samp_dat: these
+  # can only ever get a purely synthetic estimate (no domain-specific
+  # random effect is estimable without sample data in the domain)
+  oos_doms <- setdiff(unique(pop_dat[[domain_level]]), unique(samp_dat[[domain_level]]))
+
+  if (length(oos_doms) > 0) {
+    if (predict_oos) {
+      message(sprintf(
+        "%d domain(s) in pop_dat have no rows in samp_dat: %s.\nEstimates for these will be purely synthetic (no domain-specific random effect). See the `oos_flag` column of the result and the `predict_oos` argument.",
+        length(oos_doms), paste(oos_doms, collapse = ", ")
+      ))
+    } else {
+      message(sprintf(
+        "%d domain(s) in pop_dat have no rows in samp_dat and will be dropped because predict_oos = FALSE: %s",
+        length(oos_doms), paste(oos_doms, collapse = ", ")
+      ))
+      pop_dat <- pop_dat[pop_dat[[domain_level]] %in% unique(samp_dat[[domain_level]]), ]
+      oos_doms <- character(0)
+    }
   }
 
   Y <- toString(lin_formula[[2]])
@@ -205,7 +237,9 @@ saeczi <- function(samp_dat,
         list_rbind() |> 
         as.matrix()
 
+      # see comments in boot_rep_par() (utils.R) for why both are zeroed
       u_lm[is.na(u_lm)] <- 0
+      u_glm[is.na(u_glm)] <- 0
 
       preds_full <- generate_mse(.data = boot_pop_data,
                                  truth = boot_truth,
@@ -235,6 +269,13 @@ saeczi <- function(samp_dat,
     final_df <- original_pred
 
   }
+
+  oos_flag_df <- data.frame(unique(pop_dat[[domain_level]]))
+  names(oos_flag_df) <- domain_level
+  oos_flag_df$oos_flag <- oos_flag_df[[domain_level]] %in% oos_doms
+
+  final_df <- final_df |>
+    left_join(oos_flag_df, by = domain_level)
 
   out <- list(
     call = funcCall,

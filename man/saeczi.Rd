@@ -15,7 +15,8 @@ saeczi(
   estimand = "means",
   parallel = FALSE,
   transform_fun = NULL,
-  inv_transform_fun = NULL
+  inv_transform_fun = NULL,
+  predict_oos = TRUE
 )
 }
 \arguments{
@@ -40,6 +41,14 @@ saeczi(
 \item{transform_fun}{Function. Function to be applied to the response variable prior to modeling.}
 
 \item{inv_transform_fun}{Function. Inverse of transform_fun. Required if transform_fun is specified.}
+
+\item{predict_oos}{Logical. If pop_dat contains domains that have no rows in samp_dat
+(out-of-sample domains, i.e. domains with auxiliary data but no direct/sample data),
+should estimates (and MSE estimates, if mse_est = TRUE) be produced for them anyway?
+These are purely synthetic predictions: they use the fixed-effects portion of both
+models only, with no domain-specific random effect, since none can be estimated
+without sample data in the domain. Defaults to TRUE. If FALSE, such domains are
+dropped from the returned `res` data.frame entirely.}
 }
 \value{
 An object of class `zi_mod` with defined `print()` and `summary()` methods.
@@ -47,7 +56,10 @@ The object is structured like a list and contains the following elements:
 
 * call: The original function call
 
-* res: A data.frame containing the estimates and mse estimates
+* res: A data.frame containing the estimates and mse estimates. Includes a logical
+`oos_flag` column that is TRUE for any domain whose estimate is purely synthetic,
+i.e. domains present in pop_dat with no rows in samp_dat (see `predict_oos`), and
+FALSE otherwise.
 
 * lin_mod: The modeling object used to fit the original linear model
 

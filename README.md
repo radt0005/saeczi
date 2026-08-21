@@ -87,7 +87,7 @@ The function returns the following objects:
 | Name      | Description                                                               |
 |:----------|:--------------------------------------------------------------------------|
 | `call`    | The original function call                                                |
-| `res`     | A data.frame containing the estimates                                     |
+| `res`     | A data.frame containing the estimates, mse estimates, and an `oos_flag` column (see [Out-of-sample domains](#out-of-sample-domains)) |
 | `lin_mod` | The linear model object of class `merMod` used to compute the estimates   |
 | `log_mod` | The logistic model object of class `merMod` used to compute the estimates |
 
@@ -96,13 +96,13 @@ few rows of the results:
 
 ``` r
 result$res |> head()
-#>   COUNTYFIPS        mse       est
-#> 1      41001   38.30647  14.57288
-#> 2      41003  122.90662 103.33016
-#> 3      41005 1069.30963  86.08616
-#> 4      41007 4691.01214  78.79615
-#> 5      41009  356.53805  73.98920
-#> 6      41011  273.34697  90.44174
+#>   COUNTYFIPS       mse       est oos_flag
+#> 1      41001  61.39704  14.57288    FALSE
+#> 2      41003 189.29104 103.33016    FALSE
+#> 3      41005 739.70136  86.08616    FALSE
+#> 4      41007 3236.28202 78.79615    FALSE
+#> 5      41009 490.91372  73.98920    FALSE
+#> 6      41011 622.74420  90.44174    FALSE
 ```
 
 ### Parallelization
@@ -126,4 +126,30 @@ result_par <- saeczi(samp_dat = samp,
                      mse_est = TRUE,
                      parallel = TRUE,
                      B = 1000L)
+```
+
+### Out-of-sample domains
+
+Sometimes `pop_dat` contains domains with auxiliary data but no
+corresponding rows in `samp_dat`. By default (`predict_oos = TRUE`),
+`saeczi` detects these automatically and still produces an estimate for
+them (and an MSE estimate, if `mse_est = TRUE`). These are purely
+synthetic estimates: since there is no sample data for the domain, no
+domain-specific random effect can be estimated for it, so the prediction
+relies on the fixed-effects portion of both models only. The returned
+`res` data.frame includes a logical `oos_flag` column so these domains
+are easy to identify or filter on. Set `predict_oos = FALSE` to drop such
+domains from the result instead.
+
+``` r
+result_with_oos <- saeczi(samp_dat = samp,
+                          pop_dat = pop,
+                          lin_formula =  DRYBIO_AG_TPA_live_ADJ ~ tcc16 + elev,
+                          log_formula = DRYBIO_AG_TPA_live_ADJ ~ tcc16,
+                          domain_level = "COUNTYFIPS",
+                          mse_est = TRUE,
+                          B = 1000L,
+                          predict_oos = TRUE)
+
+result_with_oos$res |> subset(oos_flag)
 ```
