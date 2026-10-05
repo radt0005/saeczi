@@ -35,6 +35,18 @@
 #' of the MSE estimates shrinks as `B` grows. Values in between generate fewer
 #' populations, which saves time when generating a population is expensive
 #' compared with refitting the models. Only used when `mse_est = TRUE`.
+#' @param boot_warnings String. How to treat bootstrap refits that finish with a
+#' warning (for example, a convergence warning from `lme4::glmer()`): `"keep"`
+#' (the default) uses them in the MSE, and `"fail"` treats them as failed
+#' refits (see `boot_failures`). Either way they are counted in `boot_info`, and
+#' one summary warning is given instead of one warning per refit.
+#' @param boot_failures String. What to do with bootstrap refits that fail (an
+#' error, or a warning when `boot_warnings = "fail"`): `"drop"` (the default)
+#' leaves them out of the MSE, and `"redraw"` replaces each with a new bootstrap
+#' population and sample, up to 5 attempts per replicate, so that all `B`
+#' replicates are used when possible. Redrawing changes the random draws, so
+#' results differ from `"drop"` whenever a refit fails. A warning is given when
+#' more than 5\% of the first `B` refits fail.
 #'
 #' @returns
 #' An object of class `zi_mod` with defined `print()` and `summary()` methods.
@@ -45,11 +57,34 @@
 #' * res: A data.frame containing the estimates and mse estimates. Includes a logical
 #' `oos_flag` column that is TRUE for any domain whose estimate is purely synthetic,
 #' i.e. domains present in pop_dat with no rows in samp_dat (see `predict_oos`), and
-#' FALSE otherwise.
+#' FALSE otherwise. When `mse_est = TRUE` it also has `n_boot_used`, the number
+#' of bootstrap replicates used for that domain's MSE, and `mse_se`, the Monte
+#' Carlo standard error of `mse`: how much `mse` would typically change if the
+#' bootstrap were rerun with a different seed. `mse_se` is computed from the same
+#' replicates, treating bootstrap populations as clusters, and is NA when
+#' `n_boot_pop = 1`.
 #'
 #' * lin_mod: The modeling object used to fit the original linear model
 #'
 #' * log_mod: The modeling object used to fit the original logistic model
+#'
+#' * boot_info: Present when `mse_est = TRUE`. A list describing the bootstrap:
+#' `B`, `n_boot_pop`, `n_pop_drawn` (including redraws), the `boot_warnings` and
+#' `boot_failures` settings; counts of refits (`n_refits`, `n_ok`, `n_warning`,
+#' `n_error`), of first-attempt failures (`n_failed_first`), of replicates left
+#' out (`n_dropped`), and of singular fits (`n_singular`); `replicates`, a
+#' data.frame with each replicate's population, final status, whether it was
+#' used, number of attempts, refit time, and warning or error message; `time`,
+#' the seconds spent per population and per phase (setup, populations,
+#' sampling, refits, redraws, mse, total); `cost`, the wall-clock seconds per
+#' population (drawing it and computing its true values) and per replicate
+#' (sampling, refit, and prediction), excluding redraws; and, when
+#' some populations have two or more replicates (`1 < n_boot_pop < B`),
+#' `var_comp`, each domain's between-population (`sig2_pop`) and
+#' within-population (`sig2_samp`) variance components of the squared errors
+#' with the optimal replicates per population (`m_opt`), plus
+#' `suggested_n_boot_pop`, the number of populations that would minimise the
+#' Monte Carlo variance for the same run time (median over domains).
 #'
 #' @examples
 #' data(pop)
@@ -84,13 +119,15 @@ saeczi <- function(samp_dat,
                    transform_fun = NULL,
                    inv_transform_fun = NULL,
                    predict_oos = TRUE,
-                   n_boot_pop = 1L) {
+                   n_boot_pop = 1L,
+                   boot_warnings = "keep",
+                   boot_failures = "drop") {
 
   funcCall <- match.call()
 
   check_inherits("data.frame", samp_dat, pop_dat)
   check_inherits("formula", lin_formula, log_formula)
-  check_inherits("character", domain_level, estimand)
+  check_inherits("character", domain_level, estimand, boot_warnings, boot_failures)
   check_inherits("integer", B, n_boot_pop)
   if (length(n_boot_pop) != 1 || is.na(n_boot_pop) || n_boot_pop < 1L || n_boot_pop > B) {
     stop(paste0("n_boot_pop must be a single integer from 1 to B (here 1 to ", B, ")."))
@@ -113,6 +150,12 @@ saeczi <- function(samp_dat,
 
   if(!(estimand %in% c("means", "totals"))) {
     stop("Invalid estimand, must be either 'means' or 'totals'")
+  }
+  if (length(boot_warnings) != 1 || !(boot_warnings %in% c("keep", "fail"))) {
+    stop("Invalid boot_warnings, must be either 'keep' or 'fail'")
+  }
+  if (length(boot_failures) != 1 || !(boot_failures %in% c("drop", "redraw"))) {
+    stop("Invalid boot_failures, must be either 'drop' or 'redraw'")
   }
 
   # domains with auxiliary data in pop_dat but no rows in samp_dat: these
@@ -161,6 +204,8 @@ saeczi <- function(samp_dat,
 
   if (mse_est) {
     
+    t_start <- proc.time()[["elapsed"]]
+    
     pop_setup <- boot_pop_setup(original_out,
                                 pop_dat,
                                 domain_level,
@@ -170,101 +215,171 @@ saeczi <- function(samp_dat,
     boot_lin_formula <- reformulate(c(lin_X, rand_intercept), "response")
     boot_log_formula <- reformulate(c(log_X, rand_intercept), "response != 0")
 
-    # Each of the n_boot_pop bootstrap populations is generated, used for its
-    # truth and its share of the B bootstrap samples, and then discarded, so
-    # only one population is held in memory at a time. With n_boot_pop = 1 the
-    # random draws happen in the same order as in earlier versions.
-    pop_id <- boot_pop_index(B, n_boot_pop)
-    boot_truth <- vector("list", length = n_boot_pop)
-    boot_samp_ls <- vector("list", length = n_boot_pop)
-
-    for (k in seq_len(n_boot_pop)) {
+    # Draws one bootstrap population, computes its truth, and draws n_samp
+    # bootstrap samples from it. The population is then discarded, so only
+    # one population is held in memory at a time.
+    # Population time (draw and truth) and sampling time are recorded
+    # separately, because sampling cost grows with the number of replicates,
+    # not the number of populations.
+    pop_times <- numeric(0)
+    samp_time <- 0
+    boot_truth <- list()
+    draw_pop_and_samples <- function(n_samp) {
+      t0 <- proc.time()[["elapsed"]]
       boot_pop_data <- draw_boot_pop(pop_setup)
-      boot_truth[[k]] <- compute_boot_truth(boot_pop_data,
-                                            domain_level,
-                                            estimand,
-                                            inv_transform_fun)
-      boot_samp_ls[[k]] <- samp_by_grp(samp_dat, boot_pop_data, domain_level, sum(pop_id == k))
+      boot_truth[[length(boot_truth) + 1]] <<- compute_boot_truth(boot_pop_data,
+                                                                  domain_level,
+                                                                  estimand,
+                                                                  inv_transform_fun)
+      t1 <- proc.time()[["elapsed"]]
+      samps <- samp_by_grp(samp_dat, boot_pop_data, domain_level, n_samp)
+      pop_times <<- c(pop_times, t1 - t0)
+      samp_time <<- samp_time + proc.time()[["elapsed"]] - t1
+      samps
     }
 
-    rm(boot_pop_data)
+    # With n_boot_pop = 1 the random draws happen in the same order as in
+    # earlier versions.
+    pop_id <- boot_pop_index(B, n_boot_pop)
+    boot_samp_ls <- lapply(seq_len(n_boot_pop),
+                           \(k) draw_pop_and_samples(sum(pop_id == k)))
     boot_samp_ls <- unlist(boot_samp_ls, recursive = FALSE)
+    t_pops <- proc.time()[["elapsed"]]
+    pop_time_first <- sum(pop_times)
+    samp_time_first <- samp_time
 
-    if (parallel) {
-      with_progress({
-        boot_res <- boot_rep_par(x = 1:B,
-                                 boot_lst = boot_samp_ls,
-                                 domain_level,
-                                 boot_lin_formula,
-                                 boot_log_formula,
-                                 pop_setup$pop_x,
-                                 boot_truth,
-                                 pop_id,
-                                 estimand,
-                                 lin_X,
-                                 log_X,
-                                 inv_transform_fun)
-        })
+    res <- fit_boot_reps(boot_samp_ls,
+                         parallel,
+                         domain_level,
+                         boot_lin_formula,
+                         boot_log_formula)
 
-    } else {
+    is_failed <- \(r) r$status == "error" ||
+      (boot_warnings == "fail" && r$status == "warning")
+    statuses <- vapply(res, \(r) r$status, character(1))
+    failed <- vapply(res, is_failed, logical(1))
+    n_failed_first <- sum(failed)
+    attempts <- rep(1L, B)
 
-      res <-
-        map(.x = boot_samp_ls,
-            .f = \(.x) {
-              boot_rep(boot_samp = .x,
-                       domain_level,
-                       boot_lin_formula,
-                       boot_log_formula)
-            },
-            .progress = list(
-              type = "iterator",
-              clear = TRUE
-            ))
+    # Optionally redraw failed replicates: each gets a new population and a
+    # new sample (a new population, so its truth stays paired with it), up
+    # to max_redraw attempts per replicate.
+    max_redraw <- 5L
+    redraw_round <- 0L
+    t_redraw <- 0
+    while (boot_failures == "redraw" && any(failed) && redraw_round < max_redraw) {
+      redraw_round <- redraw_round + 1L
+      t0 <- proc.time()[["elapsed"]]
+      idx <- which(failed)
+      new_samps <- lapply(idx, \(i) {
+        pop_id[i] <<- length(boot_truth) + 1L
+        draw_pop_and_samples(1L)[[1]]
+      })
+      new_res <- fit_boot_reps(new_samps,
+                               parallel,
+                               domain_level,
+                               boot_lin_formula,
+                               boot_log_formula)
+      res[idx] <- new_res
+      statuses <- c(statuses, vapply(new_res, \(r) r$status, character(1)))
+      attempts[idx] <- attempts[idx] + 1L
+      failed[idx] <- vapply(new_res, is_failed, logical(1))
+      t_redraw <- t_redraw + proc.time()[["elapsed"]] - t0
+    }
+    t_fits <- proc.time()[["elapsed"]]
 
-      beta_lm_mat <- res |>
-        map(.f = ~ as.data.frame(t(.x$beta_lm))) |>
-        list_rbind() |> 
-        as.matrix()
+    params <- collect_boot_params(res)
 
-      beta_glm_mat <- res |>
-        map(.f = ~ as.data.frame(t(.x$beta_glm))) |>
-        list_rbind() |> 
-        as.matrix()
+    mse_out <- generate_mse(.data = pop_setup$pop_x,
+                            truth = boot_truth,
+                            pop_id = pop_id,
+                            domain_level = domain_level,
+                            beta_lm_mat = params$beta_lm_mat,
+                            beta_glm_mat = params$beta_glm_mat,
+                            u_lm = params$u_lm,
+                            u_glm = params$u_glm,
+                            lin_X = lin_X,
+                            log_X = log_X,
+                            estimand = estimand,
+                            inv = inv_transform_fun,
+                            failed = failed)
 
-      u_lm <- res |>
-        map(.f = ~ as.data.frame(t(.x$u_lm))) |>
-        list_rbind() |> 
-        as.matrix()
+    mse_summ <- summarise_boot_mse(mse_out$sq_err, pop_id, n_boot_pop)
+    t_end <- proc.time()[["elapsed"]]
 
-      u_glm <- res |>
-        map(.f = ~ as.data.frame(t(.x$u_glm))) |>
-        list_rbind() |> 
-        as.matrix()
+    mse_df <- data.frame(mse_out$domain, mse_summ$by_domain)
+    names(mse_df)[1] <- domain_level
 
-      # see comments in boot_rep_par() (utils.R) for why both are zeroed
-      u_lm[is.na(u_lm)] <- 0
-      u_glm[is.na(u_glm)] <- 0
+    # Cost per population (draw and truth) and per replicate (sampling,
+    # refit, and prediction), as wall-clock time, so a parallel run's refit
+    # cost reflects its workers. Redraws are left out of both.
+    n_fits <- length(statuses)
+    t_refits <- t_fits - t_pops - t_redraw
+    c_pop <- pop_time_first / n_boot_pop
+    c_fit <- (samp_time_first + t_refits + (t_end - t_fits)) / B
+    suggestion <- suggest_n_boot_pop(mse_summ$var_comp, c_pop, c_fit, B)
 
-      preds_full <- generate_mse(.data = pop_setup$pop_x,
-                                 truth = boot_truth,
-                                 pop_id = pop_id,
-                                 domain_level = domain_level,
-                                 beta_lm_mat = beta_lm_mat,
-                                 beta_glm_mat = beta_glm_mat,
-                                 u_lm = u_lm,
-                                 u_glm = u_glm,
-                                 lin_X = lin_X,
-                                 log_X = log_X,
-                                 estimand = estimand,
-                                 inv = inv_transform_fun)
-    
-
-      boot_res <- preds_full
-
+    var_comp <- mse_summ$var_comp
+    if (!is.null(var_comp)) {
+      var_comp <- data.frame(mse_out$domain, var_comp, m_opt = suggestion$m_opt)
+      names(var_comp)[1] <- domain_level
     }
 
-    mse_df <- setNames(boot_res,
-                       c(domain_level, "mse"))
+    boot_info <- list(
+      B = B,
+      n_boot_pop = n_boot_pop,
+      n_pop_drawn = length(boot_truth),
+      boot_warnings = boot_warnings,
+      boot_failures = boot_failures,
+      n_refits = n_fits,
+      n_ok = sum(statuses == "ok"),
+      n_warning = sum(statuses == "warning"),
+      n_error = sum(statuses == "error"),
+      n_failed_first = n_failed_first,
+      n_dropped = sum(failed),
+      n_singular = sum(vapply(res, \(r) isTRUE(r$singular), logical(1))),
+      replicates = data.frame(
+        replicate = seq_len(B),
+        population = pop_id,
+        status = vapply(res, \(r) r$status, character(1)),
+        used = colSums(!is.na(mse_out$sq_err)) > 0,
+        attempts = attempts,
+        time = vapply(res, \(r) r$time, numeric(1)),
+        message = vapply(res, \(r) r$message, character(1))
+      ),
+      time = list(
+        population = pop_times,
+        phase = c(setup = t_pops - t_start - pop_time_first - samp_time_first,
+                  populations = pop_time_first,
+                  sampling = samp_time_first,
+                  refits = t_refits,
+                  redraws = t_redraw,
+                  mse = t_end - t_fits,
+                  total = t_end - t_start)
+      ),
+      cost = c(population = c_pop, replicate = c_fit),
+      var_comp = var_comp,
+      suggested_n_boot_pop = suggestion$n_boot_pop
+    )
+
+    if (n_failed_first / B > 0.05) {
+      warning(sprintf(
+        "%d of %d bootstrap refits failed (%.0f%%)%s. See `boot_info$replicates`.",
+        n_failed_first, B, 100 * n_failed_first / B,
+        if (boot_failures == "redraw") {
+          sprintf("; %d still failed after up to %d redraws and were left out of the MSE", sum(failed), max_redraw)
+        } else {
+          " and were left out of the MSE"
+        }
+      ))
+    }
+
+    if (boot_info$n_warning > 0 && boot_warnings == "keep") {
+      warning(sprintf(
+        "%d of %d bootstrap refits gave warnings (e.g., convergence) and were kept. See `boot_info$replicates`; use boot_warnings = \"fail\" to leave them out.",
+        boot_info$n_warning, n_fits
+      ))
+    }
 
     final_df <- mse_df |>
       left_join(original_pred, by = domain_level)
@@ -282,12 +397,22 @@ saeczi <- function(samp_dat,
   final_df <- final_df |>
     left_join(oos_flag_df, by = domain_level)
 
+  # keep the original column order and add the new MSE columns at the end
+  if (mse_est) {
+    new_cols <- c("n_boot_used", "mse_se")
+    final_df <- final_df[ , c(setdiff(names(final_df), new_cols), new_cols)]
+  }
+
   out <- list(
     call = funcCall,
     res = final_df,
     lin_mod = original_out$lmer,
     log_mod = original_out$glmer
   )
+
+  if (mse_est) {
+    out$boot_info <- boot_info
+  }
 
   structure(out, class = "zi_mod")
 
@@ -314,6 +439,21 @@ print.zi_mod <- function(x, ...) {
   cat("- Random effects: \n")
   print(summary(x$log_mod)$varcor)
   cat("\n")
+
+  if (!is.null(x$boot_info)) {
+    bi <- x$boot_info
+    cat("Bootstrap MSE: \n")
+    cat(sprintf("- %d replicates from %d population(s); %d population(s) drawn in total\n",
+                bi$B, bi$n_boot_pop, bi$n_pop_drawn))
+    cat(sprintf("- Refits: %d ok, %d with warnings (%s), %d errors; %d replicate(s) left out\n",
+                bi$n_ok, bi$n_warning, bi$boot_warnings, bi$n_error, bi$n_dropped))
+    cat(sprintf("- Time: %.1f s total; %.3f s per population, %.3f s per replicate\n",
+                bi$time$phase[["total"]], bi$cost[["population"]], bi$cost[["replicate"]]))
+    if (!is.na(bi$suggested_n_boot_pop)) {
+      cat(sprintf("- Suggested n_boot_pop for B = %d: %d\n", bi$B, bi$suggested_n_boot_pop))
+    }
+    cat("\n")
+  }
 }
 
 #' @export

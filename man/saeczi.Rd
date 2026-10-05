@@ -17,7 +17,9 @@ saeczi(
   transform_fun = NULL,
   inv_transform_fun = NULL,
   predict_oos = TRUE,
-  n_boot_pop = 1L
+  n_boot_pop = 1L,
+  boot_warnings = "keep",
+  boot_failures = "drop"
 )
 }
 \arguments{
@@ -68,6 +70,20 @@ parametric bootstrap; González-Manteiga et al. 2008), so the Monte Carlo error
 of the MSE estimates shrinks as `B` grows. Values in between generate fewer
 populations, which saves time when generating a population is expensive
 compared with refitting the models. Only used when `mse_est = TRUE`.}
+
+\item{boot_warnings}{String. How to treat bootstrap refits that finish with a
+warning (for example, a convergence warning from `lme4::glmer()`): `"keep"`
+(the default) uses them in the MSE, and `"fail"` treats them as failed
+refits (see `boot_failures`). Either way they are counted in `boot_info`, and
+one summary warning is given instead of one warning per refit.}
+
+\item{boot_failures}{String. What to do with bootstrap refits that fail (an
+error, or a warning when `boot_warnings = "fail"`): `"drop"` (the default)
+leaves them out of the MSE, and `"redraw"` replaces each with a new bootstrap
+population and sample, up to 5 attempts per replicate, so that all `B`
+replicates are used when possible. Redrawing changes the random draws, so
+results differ from `"drop"` whenever a refit fails. A warning is given when
+more than 5\% of the first `B` refits fail.}
 }
 \value{
 An object of class `zi_mod` with defined `print()` and `summary()` methods.
@@ -78,11 +94,34 @@ The object is structured like a list and contains the following elements:
 * res: A data.frame containing the estimates and mse estimates. Includes a logical
 `oos_flag` column that is TRUE for any domain whose estimate is purely synthetic,
 i.e. domains present in pop_dat with no rows in samp_dat (see `predict_oos`), and
-FALSE otherwise.
+FALSE otherwise. When `mse_est = TRUE` it also has `n_boot_used`, the number
+of bootstrap replicates used for that domain's MSE, and `mse_se`, the Monte
+Carlo standard error of `mse`: how much `mse` would typically change if the
+bootstrap were rerun with a different seed. `mse_se` is computed from the same
+replicates, treating bootstrap populations as clusters, and is NA when
+`n_boot_pop = 1`.
 
 * lin_mod: The modeling object used to fit the original linear model
 
 * log_mod: The modeling object used to fit the original logistic model
+
+* boot_info: Present when `mse_est = TRUE`. A list describing the bootstrap:
+`B`, `n_boot_pop`, `n_pop_drawn` (including redraws), the `boot_warnings` and
+`boot_failures` settings; counts of refits (`n_refits`, `n_ok`, `n_warning`,
+`n_error`), of first-attempt failures (`n_failed_first`), of replicates left
+out (`n_dropped`), and of singular fits (`n_singular`); `replicates`, a
+data.frame with each replicate's population, final status, whether it was
+used, number of attempts, refit time, and warning or error message; `time`,
+the seconds spent per population and per phase (setup, populations,
+sampling, refits, redraws, mse, total); `cost`, the wall-clock seconds per
+population (drawing it and computing its true values) and per replicate
+(sampling, refit, and prediction), excluding redraws; and, when
+some populations have two or more replicates (`1 < n_boot_pop < B`),
+`var_comp`, each domain's between-population (`sig2_pop`) and
+within-population (`sig2_samp`) variance components of the squared errors
+with the optimal replicates per population (`m_opt`), plus
+`suggested_n_boot_pop`, the number of populations that would minimise the
+Monte Carlo variance for the same run time (median over domains).
 }
 \description{
 Fit a zero-inflation estimator.

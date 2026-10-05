@@ -91,7 +91,7 @@ fit_zi <- function(samp_dat,
   
 }
 
-#' Generates mse estimates
+#' Generates the bootstrap squared errors
 #' 
 #' @param .data The population data: the domain column and the predictor columns
 #' @param truth A list with one data.frame per bootstrap population, each containing the true domain level values from that population
@@ -104,8 +104,11 @@ fit_zi <- function(samp_dat,
 #' @param lin_X A character vector with the names of the predictor variables used in the linear model
 #' @param log_X A character vector with the names of the predictor variables used in the logistic model
 #' @param estimand A string specifying whether the estimates should be 'totals' or 'means'
+#' @param failed A logical vector of length B; replicates marked TRUE are excluded (their squared errors are set to NA)
 #' 
-#' @return A data.frame with the mse estimate for every domain
+#' @return A list with `domain` (the domain identifiers, in the original
+#' type) and `sq_err`, a domain-by-replicate matrix of squared errors
+#' (NA for excluded or unusable replicates)
 #' @noRd
 generate_mse <- function(.data,
                          truth,
@@ -118,7 +121,8 @@ generate_mse <- function(.data,
                          lin_X,
                          log_X,
                          estimand,
-                         inv) {
+                         inv,
+                         failed = rep(FALSE, length(pop_id))) {
   
   boot_pop_by_dom <- split(.data, f = .data[[domain_level]])
   
@@ -158,6 +162,26 @@ generate_mse <- function(.data,
   u_lm <- align_to_doms(u_lm, dom_order)
   u_glm <- align_to_doms(u_glm, dom_order)
 
+  # Align the fixed-effect columns by name to the design-matrix columns
+  # (generate_preds() multiplies them positionally). A failed replicate's
+  # coefficients are all NA, and list_rbind() orders columns by first
+  # appearance, so without this a failed first replicate could reorder the
+  # columns. A coefficient missing from every replicate (e.g. dropped as
+  # rank deficient) becomes an NA column, so those replicates give NA
+  # predictions and are left out, as before.
+  align_to_design <- function(beta_mat, design_cols) {
+    missing <- setdiff(design_cols, colnames(beta_mat))
+    if (length(missing) > 0) {
+      to_append <- matrix(NA_real_, nrow = nrow(beta_mat), ncol = length(missing),
+                          dimnames = list(NULL, missing))
+      beta_mat <- cbind(beta_mat, to_append)
+    }
+    beta_mat[, design_cols, drop = FALSE]
+  }
+
+  beta_lm_mat <- align_to_design(beta_lm_mat, colnames(design_mat_ls[[1]]$design_mat_lm))
+  beta_glm_mat <- align_to_design(beta_glm_mat, colnames(design_mat_ls[[1]]$design_mat_glm))
+
   dom_res_wide <- generate_preds(beta_lm = beta_lm_mat,
                                  beta_glm = beta_glm_mat,
                                  u_lm = u_lm,
@@ -179,15 +203,116 @@ generate_mse <- function(.data,
     nrow = nrow(truth_ordered)
   )
   
-  mse <- (dom_res_wide - truth_mat[ , pop_id, drop = FALSE])^2 |>
-    rowMeans(na.rm = TRUE)
+  sq_err <- (dom_res_wide - truth_mat[ , pop_id, drop = FALSE])^2
+  sq_err[ , failed] <- NA
   
-  res_doms <- data.frame(
-    domain = truth_ordered[[domain_level]],
-    mse = mse
-  )
+  list(domain = truth_ordered[[domain_level]],
+       sq_err = sq_err)
   
-  return(res_doms)
+}
+
+#' Summarise the bootstrap squared errors by domain
+#' 
+#' `mse` is the mean of each domain's squared errors over the replicates
+#' used. `mse_se` is its Monte Carlo standard error, treating bootstrap
+#' populations as clusters: with S_k and C_k the sum and count of a domain's
+#' squared errors in population k, and K the number of populations used,
+#' SE^2 = K / (K - 1) * sum_k (S_k - mse * C_k)^2 / (sum_k C_k)^2. With
+#' equal-size populations this equals sd(population means) / sqrt(K). It is
+#' NA when fewer than two populations were requested or used.
+#' 
+#' When some populations have two or more replicates, the squared errors
+#' are also split into between-population (`sig2_pop`) and within-population
+#' (`sig2_samp`) variance components by one-way ANOVA for unbalanced groups.
+#' 
+#' @param sq_err A domain-by-replicate matrix of squared errors
+#' @param pop_id An integer vector giving each replicate's population
+#' @param n_boot_pop Integer. The number of populations requested
+#' 
+#' @return A list with `by_domain` (a data.frame with `mse`, `n_boot_used`
+#' and `mse_se`) and `var_comp` (a data.frame with `sig2_pop` and
+#' `sig2_samp`, or NULL when the components cannot be separated)
+#' @noRd
+summarise_boot_mse <- function(sq_err, pop_id, n_boot_pop) {
+  
+  used <- !is.na(sq_err)
+  n_used <- rowSums(used)
+  mse <- rowMeans(sq_err, na.rm = TRUE)
+  
+  sq_err0 <- sq_err
+  sq_err0[!used] <- 0
+  
+  # population-by-domain sums, counts, and sums of squares
+  S <- rowsum(t(sq_err0), pop_id, reorder = FALSE)
+  C <- rowsum(t(used) * 1, pop_id, reorder = FALSE)
+  Q <- rowsum(t(sq_err0^2), pop_id, reorder = FALSE)
+  
+  K_used <- colSums(C > 0)
+  
+  mse_se <- rep(NA_real_, length(mse))
+  if (n_boot_pop >= 2) {
+    resid <- S - sweep(C, 2, mse, `*`)
+    se2 <- K_used / (K_used - 1) * colSums(resid^2) / n_used^2
+    mse_se <- ifelse(K_used >= 2, sqrt(se2), NA_real_)
+  }
+  
+  var_comp <- NULL
+  if (n_boot_pop >= 2 && any(C >= 2)) {
+    N <- colSums(C)
+    ss_within <- colSums(Q) - colSums(ifelse(C > 0, S^2 / C, 0))
+    ss_between <- colSums(ifelse(C > 0, S^2 / C, 0)) - N * mse^2
+    ms_within <- ss_within / (N - K_used)
+    ms_between <- ss_between / (K_used - 1)
+    n0 <- (N - colSums(C^2) / N) / (K_used - 1)
+    ok <- K_used >= 2 & N > K_used
+    var_comp <- data.frame(
+      sig2_pop = ifelse(ok, (ms_between - ms_within) / n0, NA_real_),
+      sig2_samp = ifelse(ok, ms_within, NA_real_)
+    )
+  }
+  
+  list(by_domain = data.frame(mse = mse,
+                              n_boot_used = n_used,
+                              mse_se = mse_se),
+       var_comp = var_comp)
+  
+}
+
+#' Suggest a number of bootstrap populations
+#' 
+#' Uses the two-stage sampling optimum m_opt = sqrt((c_pop / c_fit) *
+#' (sig2_samp / sig2_pop)) replicates per population, computed per domain
+#' and summarised by the median, then n_boot_pop = B / m_opt, rounded and
+#' kept within 1 to B.
+#' 
+#' @param var_comp The `var_comp` data.frame from `summarise_boot_mse()`
+#' @param c_pop Seconds per bootstrap population
+#' @param c_fit Seconds per replicate (refit and prediction)
+#' @param B Integer. Total number of bootstrap replicates
+#' 
+#' @return A list with the per-domain `m_opt` and the suggested `n_boot_pop`
+#' (NA when it cannot be computed)
+#' @noRd
+suggest_n_boot_pop <- function(var_comp, c_pop, c_fit, B) {
+  
+  if (is.null(var_comp) || !is.finite(c_pop) || !is.finite(c_fit) || c_fit <= 0) {
+    return(list(m_opt = NULL, n_boot_pop = NA_integer_))
+  }
+  
+  ratio <- var_comp$sig2_samp / var_comp$sig2_pop
+  # no detectable between-population variance: fewer populations suffice
+  ratio[!is.na(var_comp$sig2_pop) & var_comp$sig2_pop <= 0] <- Inf
+  m_opt <- sqrt((c_pop / c_fit) * ratio)
+  
+  m_med <- stats::median(m_opt, na.rm = TRUE)
+  if (is.na(m_med)) {
+    return(list(m_opt = m_opt, n_boot_pop = NA_integer_))
+  }
+  
+  k <- if (is.infinite(m_med)) 1 else round(B / max(m_med, 1))
+  
+  list(m_opt = m_opt,
+       n_boot_pop = as.integer(min(max(k, 1), B)))
   
 }
 
@@ -356,69 +481,95 @@ boot_pop_index <- function(B, n_boot_pop) {
   
 }
 
-#' Bootstrap procedure for the parallel option
+#' Bootstrap refits for the parallel option
 #' 
-#' @param x The vector 1:B where B is the number of total bootstraps
+#' @param x The vector of replicate indexes
 #' @param boot_lst A list where each element contains a bootstrap sample
 #' @param domain_level Character. Domain identifier name
 #' @param boot_lin_formula The formula to be used for the linear model
 #' @param boot_log_formula The formula to be used for the logistic model
-#' @param pop_x The population data: the domain column and the predictor columns
-#' @param boot_truth A list with one data.frame per bootstrap population, each containing the true domain level values from that population
-#' @param pop_id An integer vector of length B giving the bootstrap population of each replicate
-#' @param estimand A string specifying whether the estimates should be 'totals' or 'means'
-#' @param lin_X A character vector with the names of the predictor variables used in the linear model
-#' @param log_X A character vector with the names of the predictor variables used in the logistic model
 #' 
-#' @return A list containing the mse estimates data.frame.
+#' @return A list with one `boot_rep()` result per bootstrap sample
 #' @noRd
 #' 
 boot_rep_par <- function(x,
                          boot_lst,
                          domain_level,
                          boot_lin_formula,
-                         boot_log_formula,
-                         pop_x,
-                         boot_truth,
-                         pop_id,
-                         estimand,
-                         lin_X,
-                         log_X,
-                         inv_transform_fun) {
+                         boot_log_formula) {
   
   p <- progressor(steps = length(x))
   
-  res <- 
-    furrr::future_map(.x = boot_lst,
-                      .f = \(.x) {
-                        p()
-                        boot_rep(boot_samp = .x,
-                                 domain_level,
-                                 boot_lin_formula,
-                                 boot_log_formula)
-                      },
-                      .options = furrr_options(seed = TRUE))
+  furrr::future_map(.x = boot_lst,
+                    .f = \(.x) {
+                      p()
+                      boot_rep(boot_samp = .x,
+                               domain_level,
+                               boot_lin_formula,
+                               boot_log_formula)
+                    },
+                    .options = furrr_options(seed = TRUE))
   
-  beta_lm_mat <- res |>
-    map(.f = ~ as.data.frame(t(.x$beta_lm))) |>
-    list_rbind() |> 
-    as.matrix()
+}
+
+#' Refit both models to each bootstrap sample
+#' 
+#' @inheritParams boot_rep_par
+#' @param parallel Logical. Whether to run the refits in parallel
+#' 
+#' @return A list with one `boot_rep()` result per bootstrap sample
+#' @noRd
+fit_boot_reps <- function(boot_lst,
+                          parallel,
+                          domain_level,
+                          boot_lin_formula,
+                          boot_log_formula) {
   
-  beta_glm_mat <- res |>
-    map(.f = ~ as.data.frame(t(.x$beta_glm))) |>
+  if (parallel) {
+    with_progress({
+      res <- boot_rep_par(x = seq_along(boot_lst),
+                          boot_lst = boot_lst,
+                          domain_level,
+                          boot_lin_formula,
+                          boot_log_formula)
+    })
+  } else {
+    res <-
+      map(.x = boot_lst,
+          .f = \(.x) {
+            boot_rep(boot_samp = .x,
+                     domain_level,
+                     boot_lin_formula,
+                     boot_log_formula)
+          },
+          .progress = list(
+            type = "iterator",
+            clear = TRUE
+          ))
+  }
+  
+  res
+  
+}
+
+#' Combine the bootstrap refits' parameters into matrices
+#' 
+#' @param res A list of `boot_rep()` results
+#' 
+#' @return A list of four matrices with one row per replicate: fixed effects
+#' (`beta_lm_mat`, `beta_glm_mat`) and domain random effects (`u_lm`, `u_glm`)
+#' @noRd
+collect_boot_params <- function(res) {
+  
+  to_mat <- \(nm) res |>
+    map(.f = ~ as.data.frame(t(.x[[nm]]))) |>
     list_rbind() |>
     as.matrix()
   
-  u_lm <- res |> 
-    map(.f = ~ as.data.frame(t(.x$u_lm))) |> 
-    list_rbind() |> 
-    as.matrix()
-  
-  u_glm <- res |> 
-    map(.f = ~ as.data.frame(t(.x$u_glm))) |> 
-    list_rbind() |> 
-    as.matrix()
-  
+  beta_lm_mat <- to_mat("beta_lm")
+  beta_glm_mat <- to_mat("beta_glm")
+  u_lm <- to_mat("u_lm")
+  u_glm <- to_mat("u_glm")
   
   # sometimes u_lm will have fewer domains once it is filtered
   # down to positive response values
@@ -430,21 +581,11 @@ boot_rep_par <- function(x,
   # fit; treating that as a 0 random effect gives a purely synthetic
   # (population-average) prediction for them, consistent with u_lm above
   u_glm[is.na(u_glm)] <- 0
-
-  preds_full <- generate_mse(.data = pop_x,
-                             truth = boot_truth,
-                             pop_id = pop_id,
-                             domain_level = domain_level,
-                             beta_lm_mat = beta_lm_mat,
-                             beta_glm_mat = beta_glm_mat,
-                             u_lm = u_lm,
-                             u_glm = u_glm,
-                             lin_X = lin_X,
-                             log_X = log_X,
-                             estimand = estimand,
-                             inv = inv_transform_fun)
   
-  return(preds_full)
+  list(beta_lm_mat = beta_lm_mat,
+       beta_glm_mat = beta_glm_mat,
+       u_lm = u_lm,
+       u_glm = u_glm)
   
 }
 
@@ -533,12 +674,20 @@ mod_param_fmt <- function(.fit, ref = NULL) {
 
 #' Perform a single bootstrap repetition
 #' 
+#' Warnings from the model fits (for example, convergence warnings) are
+#' recorded and muffled rather than passed on, so that `saeczi()` can count
+#' them and report them once.
+#' 
 #' @param boot_samp data.frame, An individual bootstrap sample.
 #' @param domain_level Character. Domain identifier name
 #' @param boot_lin_formula The formula to be used for the linear model
 #' @param boot_log_formula The formula to be used for the logistic model
 #' 
-#' @return A list containing the properly formated model parameters from fitting the two models to the sample data.
+#' @return A list containing the properly formated model parameters from
+#' fitting the two models to the sample data, plus `status` ("ok", "warning",
+#' or "error"), `message` (the warning or error messages, "" if none),
+#' `singular` (whether either fit is singular; NA after an error), and `time`
+#' (elapsed seconds).
 #' @noRd
 #' 
 boot_rep <- function(boot_samp,
@@ -546,32 +695,57 @@ boot_rep <- function(boot_samp,
                      boot_lin_formula,
                      boot_log_formula) {
   
+  start_time <- proc.time()[["elapsed"]]
+  warn_msgs <- character(0)
+  error_msg <- NULL
+  
   boot_samp_fit  <- tryCatch(
-    {
-      out <- fit_zi(boot_samp,
-                    boot_lin_formula,
-                    boot_log_formula,
-                    domain_level)
-      
-      ps <- mod_param_fmt(out)
-      return(ps)
-      
-    },
+    withCallingHandlers(
+      {
+        out <- fit_zi(boot_samp,
+                      boot_lin_formula,
+                      boot_log_formula,
+                      domain_level)
+        
+        ps <- mod_param_fmt(out)
+        ps$singular <- lme4::isSingular(out$lmer) || lme4::isSingular(out$glmer)
+        ps
+      },
+      warning = function(w) {
+        warn_msgs <<- c(warn_msgs, conditionMessage(w))
+        invokeRestart("muffleWarning")
+      }
+    ),
     error = function(cond) {
+      
+      error_msg <<- conditionMessage(cond)
       
       doms <- unique(boot_samp[[domain_level]])
       lm_cfs <- labels(terms(boot_lin_formula))
-      glm_cfs <- labels(terms(boot_lin_formula))
+      glm_cfs <- labels(terms(boot_log_formula))
       
       ps <- mod_param_fmt(.fit = NULL,
                           ref = list(d = doms,
                                      .lm = lm_cfs,
                                      .glm = glm_cfs))
-      
-      return(ps)
+      ps$singular <- NA
+      ps
       
     }
   )
+  
+  if (!is.null(error_msg)) {
+    boot_samp_fit$status <- "error"
+    boot_samp_fit$message <- error_msg
+  } else if (length(warn_msgs) > 0) {
+    boot_samp_fit$status <- "warning"
+    boot_samp_fit$message <- paste(unique(warn_msgs), collapse = "; ")
+  } else {
+    boot_samp_fit$status <- "ok"
+    boot_samp_fit$message <- ""
+  }
+  
+  boot_samp_fit$time <- proc.time()[["elapsed"]] - start_time
   
   return(boot_samp_fit)
   

@@ -1,5 +1,32 @@
 # saeczi (development version)
 
+* Bootstrap refits that fail or warn are now tracked instead of handled
+  silently. Previously a refit that errored was dropped from the MSE without
+  being counted, and a refit that gave a warning (e.g. a `glmer()`
+  convergence warning) was used, with one console warning per refit. New
+  arguments: `boot_warnings` (`"keep"`, the default, or `"fail"`) and
+  `boot_failures` (`"drop"`, the default, or `"redraw"`, which replaces each
+  failed replicate with a new population and sample, up to 5 attempts). One
+  summary warning is given for warned refits, and another when more than 5%
+  of refits fail. The defaults reproduce earlier MSE values exactly.
+
+* Fixed: when the first bootstrap refit failed and the linear and logistic
+  formulas had different predictors, every domain's MSE was `NaN`. A failed
+  refit's logistic coefficients were named after the linear formula, which
+  reordered the coefficient columns; they are now named correctly and matched
+  to the design matrix by name.
+
+* `res` gains two columns at the end when `mse_est = TRUE`: `n_boot_used`
+  (replicates used for each domain) and `mse_se` (the Monte Carlo standard
+  error of `mse`, computed from the same replicates with bootstrap
+  populations as clusters; `NA` when `n_boot_pop = 1`).
+
+* The result gains a `boot_info` element describing the bootstrap: refit
+  counts by status, per-replicate status and messages, time per population
+  and per phase, cost per population and per replicate, and, when
+  `1 < n_boot_pop < B`, each domain's between- and within-population variance
+  components with a suggested `n_boot_pop`. `print()` shows a short summary.
+
 * `saeczi()` gains an `n_boot_pop` argument (default `1L`) for MSE
   estimation: the number of bootstrap populations, from 1 to `B`. The `B`
   bootstrap replicates are split as evenly as possible across `n_boot_pop`
