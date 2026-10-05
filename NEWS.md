@@ -1,5 +1,20 @@
 # saeczi (development version)
 
+* `saeczi()` gains an `n_boot_pop` argument (default `1L`) for MSE
+  estimation: the number of bootstrap populations, from 1 to `B`. The `B`
+  bootstrap replicates are split as evenly as possible across `n_boot_pop`
+  independently generated populations, and each replicate is compared with
+  the true domain values of its own population; `B` stays the total number of
+  replicates. The default reproduces earlier results exactly for the same seed
+  (one population for all replicates, as in Chandra and Sud 2012). With one
+  population, each domain's MSE depends on a single draw of its random effect,
+  so it can vary greatly between runs however large `B` is. `n_boot_pop = B`
+  draws a new population for every replicate (the standard parametric
+  bootstrap), so the Monte Carlo error shrinks as `B` grows. Internally,
+  `generate_boot_pop()` is split into `boot_pop_setup()` (computed once) and
+  `draw_boot_pop()` (per population), and only one population is held in
+  memory at a time.
+
 * The parametric bootstrap MSE estimator now accounts for the variance
   contributed by the logistic model's domain random effect. Previously the
   bootstrap "truth" population plugged in the logistic model's estimated

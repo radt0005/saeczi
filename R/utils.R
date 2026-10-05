@@ -93,8 +93,9 @@ fit_zi <- function(samp_dat,
 
 #' Generates mse estimates
 #' 
-#' @param .data The bootstrap population data
-#' @param truth A data.frame containing the true domain level values from the bootstrap population data
+#' @param .data The population data: the domain column and the predictor columns
+#' @param truth A list with one data.frame per bootstrap population, each containing the true domain level values from that population
+#' @param pop_id An integer vector of length B giving the bootstrap population (index into `truth`) of each replicate
 #' @param domain_level Character. Domain identifier name
 #' @param beta_lm_mat A matrix containing the fixed effects coefficients resulting from fitting the linear model to each bootstrap sample
 #' @param beta_glm_mat A matrix containing the fixed effects coefficients resulting from fitting the logistic model to each bootstrap sample
@@ -108,6 +109,7 @@ fit_zi <- function(samp_dat,
 #' @noRd
 generate_mse <- function(.data,
                          truth,
+                         pop_id,
                          domain_level,
                          beta_lm_mat,
                          beta_glm_mat,
@@ -165,10 +167,19 @@ generate_mse <- function(.data,
                                  estimand = estimand,
                                  inv = inv)
   
-  truth_ordered <- truth[order(match(truth[[domain_level]], dom_order)), ]
-  truth_vec <- truth_ordered$domain_est
+  truth_ordered <- truth[[1]][order(match(truth[[1]][[domain_level]], dom_order)), ]
   
-  mse <- (dom_res_wide - truth_vec)^2 |>
+  # one column of true domain values per bootstrap population, then one
+  # column per replicate, so each replicate is compared with the truth of
+  # the population it was sampled from
+  truth_mat <- matrix(
+    vapply(truth,
+           \(.t) .t$domain_est[match(truth_ordered[[domain_level]], .t[[domain_level]])],
+           numeric(nrow(truth_ordered))),
+    nrow = nrow(truth_ordered)
+  )
+  
+  mse <- (dom_res_wide - truth_mat[ , pop_id, drop = FALSE])^2 |>
     rowMeans(na.rm = TRUE)
   
   res_doms <- data.frame(
@@ -181,6 +192,10 @@ generate_mse <- function(.data,
 }
 
 #' Generate the Bootstrap population data
+#' 
+#' Wrapper that generates a single bootstrap population. `saeczi()` calls
+#' `boot_pop_setup()` once and `draw_boot_pop()` once per bootstrap
+#' population instead.
 #' 
 #' @param original_out List containing original model objects
 #' @param pop_dat The population data frame
@@ -198,6 +213,29 @@ generate_boot_pop <- function(original_out,
                               all_preds,
                               transform_fun) {
   
+  setup <- boot_pop_setup(original_out, pop_dat, domain_level, log_X, all_preds)
+  
+  draw_boot_pop(setup)
+  
+}
+
+#' Precompute the parts of a bootstrap population that do not change
+#' between bootstrap populations
+#' 
+#' The design matrix, the fixed-effect parts of both models, and the
+#' variance-component estimates are the same for every bootstrap population;
+#' only the random draws in `draw_boot_pop()` differ.
+#' 
+#' @inheritParams generate_boot_pop
+#' 
+#' @return A list used by `draw_boot_pop()`
+#' @noRd
+boot_pop_setup <- function(original_out,
+                           pop_dat,
+                           domain_level,
+                           log_X,
+                           all_preds) {
+  
   zi_mod_coefs <- mse_coefs(original_out$lmer, original_out$glmer)
 
   x_matrix <- model.matrix(
@@ -205,24 +243,41 @@ generate_boot_pop <- function(original_out,
     data = pop_dat[ , all_preds, drop = FALSE]
   )
 
-  indv_re <- data.frame(
-    dom = pop_dat[ , domain_level, drop = TRUE],
-    eps_ij = rnorm(nrow(pop_dat), 0, sqrt(zi_mod_coefs$sig2_eps_hat))
-  )
-
   # tweak for allowing new levels (also covers domains present in pop_dat
   # but absent from the original sample, i.e. out-of-sample domains)
   pop_doms <- unique(pop_dat[[domain_level]])
   all_doms <- union(pop_doms, zi_mod_coefs$domain_levels)
 
-  area_re_lkp <- setNames(
-    rnorm(length(all_doms), 0, sqrt(zi_mod_coefs$sig2_mu_hat)),
-    all_doms
+  list(
+    coefs = zi_mod_coefs,
+    pop_x = pop_dat[ , c(domain_level, all_preds)],
+    dom = pop_dat[ , domain_level, drop = TRUE],
+    all_doms = all_doms,
+    log_fixed = x_matrix[ , c("(Intercept)", log_X)] %*% zi_mod_coefs$alpha_1,
+    lin_fixed = x_matrix[, colnames(model.matrix(original_out$lmer))] %*% zi_mod_coefs$beta_hat
   )
+  
+}
 
-  rand_effs <- data.frame(
-    indv_re,
-    u_j = area_re_lkp[pop_dat[ , domain_level, drop = TRUE]]
+#' Draw one bootstrap population
+#' 
+#' The random draws are made in a fixed order (unit errors, linear domain
+#' effects, logistic domain effects, nonzero indicators), so a single
+#' population drawn after a given seed matches earlier versions of saeczi.
+#' 
+#' @param setup The list returned by `boot_pop_setup()`
+#' 
+#' @return The population bootstrap data
+#' @noRd
+draw_boot_pop <- function(setup) {
+  
+  zi_mod_coefs <- setup$coefs
+  
+  eps_ij <- rnorm(length(setup$dom), 0, sqrt(zi_mod_coefs$sig2_eps_hat))
+
+  area_re_lkp <- setNames(
+    rnorm(length(setup$all_doms), 0, sqrt(zi_mod_coefs$sig2_mu_hat)),
+    setup$all_doms
   )
 
   # Draw a fresh domain random effect for the logistic model from its
@@ -234,39 +289,70 @@ generate_boot_pop <- function(original_out,
   # logistic model actually contributes to the domain-level estimates,
   # for in-sample and out-of-sample domains alike.
   b_i_lkp <- setNames(
-    rnorm(length(all_doms), 0, sqrt(zi_mod_coefs$sig2_b_hat)),
-    all_doms
+    rnorm(length(setup$all_doms), 0, sqrt(zi_mod_coefs$sig2_b_hat)),
+    setup$all_doms
   )
 
-  pop_b_i <- data.frame(
-    dom = pop_dat[ , domain_level, drop = TRUE],
-    b_i = b_i_lkp[pop_dat[ , domain_level, drop = TRUE]]
-  )
-
-  x <- x_matrix[ , c("(Intercept)", log_X)] %*% zi_mod_coefs$alpha_1 + pop_b_i$b_i
+  x <- setup$log_fixed + b_i_lkp[setup$dom]
   p_hat_i <- binomial()$linkinv(x)
   
   delta_i_star <- rbinom(length(p_hat_i), 1, p_hat_i)
   
-  boot_dat_params <- list(
-    random_effects = rand_effs,
-    p_hat_i = p_hat_i,
-    delta_i_star = delta_i_star
-  )
-  
-  linear_preds <- (x_matrix[, colnames(model.matrix(original_out$lmer))] %*% zi_mod_coefs$beta_hat) +
-    boot_dat_params$random_effects$u_j + boot_dat_params$random_effects$eps_ij
+  linear_preds <- setup$lin_fixed + area_re_lkp[setup$dom] + eps_ij
   
   boot_pop_data <- data.frame(
-    pop_dat[ , c(domain_level, all_preds)],
-    response = linear_preds * boot_dat_params$delta_i_star
+    setup$pop_x,
+    response = linear_preds * delta_i_star
   ) 
   
-  # if (!is.null(transform_fun)) {
-  #   boot_pop_data$response <- transform_fun(boot_pop_data$response)
-  # }
-  
   return(boot_pop_data)
+  
+}
+
+#' Compute the true domain values of a bootstrap population
+#' 
+#' @param boot_pop_data The bootstrap population data
+#' @param domain_level Character. Domain identifier name
+#' @param estimand A string specifying whether the estimates should be 'totals' or 'means'
+#' @param inv_transform_fun Function or NULL. Inverse of the response transformation
+#' 
+#' @return A data.frame with one row per domain and a `domain_est` column
+#' @noRd
+compute_boot_truth <- function(boot_pop_data,
+                               domain_level,
+                               estimand,
+                               inv_transform_fun) {
+  
+  if (!is.null(inv_transform_fun)) {
+    boot_pop_data <- boot_pop_data |>
+      mutate(response = inv_transform_fun(response))
+  }
+  
+  agg_fun <- if (estimand == "means") mean else sum
+  
+  boot_pop_data |>
+    group_by(!!sym(domain_level)) |>
+    summarise(domain_est = agg_fun(response))
+  
+}
+
+#' Assign bootstrap replicates to bootstrap populations
+#' 
+#' Splits B replicates as evenly as possible across n_boot_pop populations;
+#' when B is not divisible by n_boot_pop, the first B %% n_boot_pop
+#' populations get one extra replicate.
+#' 
+#' @param B Integer. Total number of bootstrap replicates
+#' @param n_boot_pop Integer. Number of bootstrap populations
+#' 
+#' @return An integer vector of length B giving each replicate's population
+#' @noRd
+boot_pop_index <- function(B, n_boot_pop) {
+  
+  sizes <- rep(B %/% n_boot_pop, n_boot_pop) +
+    (seq_len(n_boot_pop) <= B %% n_boot_pop)
+  
+  rep(seq_len(n_boot_pop), times = sizes)
   
 }
 
@@ -277,8 +363,9 @@ generate_boot_pop <- function(original_out,
 #' @param domain_level Character. Domain identifier name
 #' @param boot_lin_formula The formula to be used for the linear model
 #' @param boot_log_formula The formula to be used for the logistic model
-#' @param boot_pop_data The bootstrap population data
-#' @param boot_truth A data.frame containing the true domain level values from the bootstrap population data
+#' @param pop_x The population data: the domain column and the predictor columns
+#' @param boot_truth A list with one data.frame per bootstrap population, each containing the true domain level values from that population
+#' @param pop_id An integer vector of length B giving the bootstrap population of each replicate
 #' @param estimand A string specifying whether the estimates should be 'totals' or 'means'
 #' @param lin_X A character vector with the names of the predictor variables used in the linear model
 #' @param log_X A character vector with the names of the predictor variables used in the logistic model
@@ -291,8 +378,9 @@ boot_rep_par <- function(x,
                          domain_level,
                          boot_lin_formula,
                          boot_log_formula,
-                         boot_pop_data,
+                         pop_x,
                          boot_truth,
+                         pop_id,
                          estimand,
                          lin_X,
                          log_X,
@@ -343,8 +431,9 @@ boot_rep_par <- function(x,
   # (population-average) prediction for them, consistent with u_lm above
   u_glm[is.na(u_glm)] <- 0
 
-  preds_full <- generate_mse(.data = boot_pop_data,
+  preds_full <- generate_mse(.data = pop_x,
                              truth = boot_truth,
+                             pop_id = pop_id,
                              domain_level = domain_level,
                              beta_lm_mat = beta_lm_mat,
                              beta_glm_mat = beta_glm_mat,

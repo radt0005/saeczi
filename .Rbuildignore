@@ -12,3 +12,6 @@ sandbox
 ^docs$
 ^pkgdown$
 ^paper$
+^saeczi_.*\.(md|pdf|patch)$
+^refs$
+^.*\.html$

@@ -18,6 +18,23 @@
 #' models only, with no domain-specific random effect, since none can be estimated
 #' without sample data in the domain. Defaults to TRUE. If FALSE, such domains are
 #' dropped from the returned `res` data.frame entirely.
+#' @param n_boot_pop Integer. The number of bootstrap populations used for MSE
+#' estimation, from 1 to `B`. The `B` bootstrap replicates are split as evenly as
+#' possible across `n_boot_pop` independently generated bootstrap populations, and
+#' each replicate is compared with the true domain values of its own population.
+#' `B` stays the total number of replicates (model refits); for example, `B = 1000L`
+#' and `n_boot_pop = 200L` give 200 populations with 5 replicates each.
+#'
+#' The default, `1L`, generates one population for all `B` replicates, as in the
+#' published algorithm (Chandra and Sud 2012; White et al. 2024), and reproduces
+#' results from earlier versions of saeczi for the same seed. With one population,
+#' each domain's MSE estimate depends on a single random draw of that domain's
+#' random effect, so it can vary greatly between runs however large `B` is.
+#' `n_boot_pop = B` generates a new population for every replicate (the standard
+#' parametric bootstrap; González-Manteiga et al. 2008), so the Monte Carlo error
+#' of the MSE estimates shrinks as `B` grows. Values in between generate fewer
+#' populations, which saves time when generating a population is expensive
+#' compared with refitting the models. Only used when `mse_est = TRUE`.
 #'
 #' @returns
 #' An object of class `zi_mod` with defined `print()` and `summary()` methods.
@@ -66,14 +83,18 @@ saeczi <- function(samp_dat,
                    parallel = FALSE,
                    transform_fun = NULL,
                    inv_transform_fun = NULL,
-                   predict_oos = TRUE) {
+                   predict_oos = TRUE,
+                   n_boot_pop = 1L) {
 
   funcCall <- match.call()
 
   check_inherits("data.frame", samp_dat, pop_dat)
   check_inherits("formula", lin_formula, log_formula)
   check_inherits("character", domain_level, estimand)
-  check_inherits("integer", B)
+  check_inherits("integer", B, n_boot_pop)
+  if (length(n_boot_pop) != 1 || is.na(n_boot_pop) || n_boot_pop < 1L || n_boot_pop > B) {
+    stop(paste0("n_boot_pop must be a single integer from 1 to B (here 1 to ", B, ")."))
+  }
   check_inherits("logical", mse_est, parallel, predict_oos)
   if (!is.null(transform_fun)) {
     if (is.null(inv_transform_fun)) {
@@ -140,52 +161,34 @@ saeczi <- function(samp_dat,
 
   if (mse_est) {
     
-    boot_pop_data <- generate_boot_pop(original_out,
-                                       pop_dat,
-                                       domain_level,
-                                       log_X,
-                                       all_preds)
+    pop_setup <- boot_pop_setup(original_out,
+                                pop_dat,
+                                domain_level,
+                                log_X,
+                                all_preds)
 
     boot_lin_formula <- reformulate(c(lin_X, rand_intercept), "response")
     boot_log_formula <- reformulate(c(log_X, rand_intercept), "response != 0")
 
-    if (estimand == "means") {
-      
-      if (!is.null(inv_transform_fun)) {
-        
-        boot_truth <- boot_pop_data |>
-          mutate(response = inv_transform_fun(response)) |>
-          group_by(!!sym(domain_level)) |>
-          summarise(domain_est = mean(response))
-        
-      } else {
-        
-        boot_truth <- boot_pop_data |>
-          group_by(!!sym(domain_level)) |>
-          summarise(domain_est = mean(response)) 
-        
-      }
-      
-    } else {
-      
-      if (!is.null(inv_transform_fun)) {
-        
-        boot_truth <- boot_pop_data |>
-          mutate(response = inv_transform_fun(response)) |>
-          group_by(!!sym(domain_level)) |>
-          summarise(domain_est = sum(response))
-        
-      } else {
-        
-        boot_truth <- boot_pop_data |>
-          group_by(!!sym(domain_level)) |>
-          summarise(domain_est = sum(response)) 
-        
-      }
+    # Each of the n_boot_pop bootstrap populations is generated, used for its
+    # truth and its share of the B bootstrap samples, and then discarded, so
+    # only one population is held in memory at a time. With n_boot_pop = 1 the
+    # random draws happen in the same order as in earlier versions.
+    pop_id <- boot_pop_index(B, n_boot_pop)
+    boot_truth <- vector("list", length = n_boot_pop)
+    boot_samp_ls <- vector("list", length = n_boot_pop)
 
+    for (k in seq_len(n_boot_pop)) {
+      boot_pop_data <- draw_boot_pop(pop_setup)
+      boot_truth[[k]] <- compute_boot_truth(boot_pop_data,
+                                            domain_level,
+                                            estimand,
+                                            inv_transform_fun)
+      boot_samp_ls[[k]] <- samp_by_grp(samp_dat, boot_pop_data, domain_level, sum(pop_id == k))
     }
 
-    boot_samp_ls <- samp_by_grp(samp_dat, boot_pop_data, domain_level, B)
+    rm(boot_pop_data)
+    boot_samp_ls <- unlist(boot_samp_ls, recursive = FALSE)
 
     if (parallel) {
       with_progress({
@@ -194,8 +197,9 @@ saeczi <- function(samp_dat,
                                  domain_level,
                                  boot_lin_formula,
                                  boot_log_formula,
-                                 boot_pop_data,
+                                 pop_setup$pop_x,
                                  boot_truth,
+                                 pop_id,
                                  estimand,
                                  lin_X,
                                  log_X,
@@ -241,8 +245,9 @@ saeczi <- function(samp_dat,
       u_lm[is.na(u_lm)] <- 0
       u_glm[is.na(u_glm)] <- 0
 
-      preds_full <- generate_mse(.data = boot_pop_data,
+      preds_full <- generate_mse(.data = pop_setup$pop_x,
                                  truth = boot_truth,
+                                 pop_id = pop_id,
                                  domain_level = domain_level,
                                  beta_lm_mat = beta_lm_mat,
                                  beta_glm_mat = beta_glm_mat,

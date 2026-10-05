@@ -4,3 +4,13 @@
 .Ruserdata
 *.Rproj
 docs
+NEWS.html
+README.html
+cran-comments.html
+saeczi_bootstrap_mse_steps.md
+saeczi_full_diff.patch
+saeczi_utils_saeczi_diff.patch
+saeczi_mse_revision_plan.md
+saeczi_bootstrap_K_B_tradeoff.md
+refs/
+*.pdf

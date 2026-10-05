@@ -16,7 +16,8 @@ saeczi(
   parallel = FALSE,
   transform_fun = NULL,
   inv_transform_fun = NULL,
-  predict_oos = TRUE
+  predict_oos = TRUE,
+  n_boot_pop = 1L
 )
 }
 \arguments{
@@ -49,6 +50,24 @@ These are purely synthetic predictions: they use the fixed-effects portion of bo
 models only, with no domain-specific random effect, since none can be estimated
 without sample data in the domain. Defaults to TRUE. If FALSE, such domains are
 dropped from the returned `res` data.frame entirely.}
+
+\item{n_boot_pop}{Integer. The number of bootstrap populations used for MSE
+estimation, from 1 to `B`. The `B` bootstrap replicates are split as evenly as
+possible across `n_boot_pop` independently generated bootstrap populations, and
+each replicate is compared with the true domain values of its own population.
+`B` stays the total number of replicates (model refits); for example, `B = 1000L`
+and `n_boot_pop = 200L` give 200 populations with 5 replicates each.
+
+The default, `1L`, generates one population for all `B` replicates, as in the
+published algorithm (Chandra and Sud 2012; White et al. 2024), and reproduces
+results from earlier versions of saeczi for the same seed. With one population,
+each domain's MSE estimate depends on a single random draw of that domain's
+random effect, so it can vary greatly between runs however large `B` is.
+`n_boot_pop = B` generates a new population for every replicate (the standard
+parametric bootstrap; González-Manteiga et al. 2008), so the Monte Carlo error
+of the MSE estimates shrinks as `B` grows. Values in between generate fewer
+populations, which saves time when generating a population is expensive
+compared with refitting the models. Only used when `mse_est = TRUE`.}
 }
 \value{
 An object of class `zi_mod` with defined `print()` and `summary()` methods.
