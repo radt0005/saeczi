@@ -13,41 +13,75 @@
 #' 
 samp_by_grp <- function(samp, pop, dom_nm, B) {
   
-  num_plots <- dplyr::count(samp, !!rlang::sym(dom_nm))
-  diff <- unique(pop[[dom_nm]])[!unique(pop[[dom_nm]]) %in% unique(samp[[dom_nm]])]
-  if (length(diff) != 0) {
-    to_append <- data.frame(
-      doms = diff,
-      n = rep(0, length(diff))
-    )
-    colnames(to_append) <- c(dom_nm, "n")
-    num_plots <- rbind(num_plots, to_append)
-  }
+  plan <- boot_samp_plan(samp, pop[[dom_nm]], dom_nm)
+  
+  draw_boot_samples(plan, pop, n_samp = B)
+  
+}
 
-  # domains with n = 0 (out-of-sample domains, i.e. present in pop but with
-  # no rows in samp) correctly draw 0 rows below instead of erroring
-  setup <- dplyr::count(pop, !!rlang::sym(dom_nm)) |>
-    dplyr::left_join(num_plots, by = dom_nm) |>
-    dplyr::mutate(add_to = dplyr::lag(cumsum(n.x), default = 0)) |>
-    dplyr::rowwise() |> 
-    dplyr::mutate(map_args = list(list(n.x, n.y, add_to))) 
+#' Plan the stratified bootstrap sampling
+#' 
+#' Finds, once, the population rows of each domain and the number of rows to
+#' draw from each (the domain's sample size; 0 for domains with no sample
+#' rows). Domains are kept in the order `dplyr::count()` gives, so the random
+#' draws happen in the same order as in earlier versions.
+#' 
+#' @param samp The sample data
+#' @param pop_dom The domain of each population row
+#' @param dom_nm Character string of the domain identifier name
+#' 
+#' @return A list with `rows` (the population row numbers of each domain),
+#' `n_pop` (domain population sizes), and `n_samp` (rows to draw per domain)
+#' @noRd
+boot_samp_plan <- function(samp, pop_dom, dom_nm) {
   
-  all_samps <- vector("list", length = B)
-  pop_ordered <- pop[order(pop[[dom_nm]]), ]
+  num_plots <- dplyr::count(samp, !!rlang::sym(dom_nm))
   
-  for (i in 1:B) {
-    ids <- setup |>
-      dplyr::mutate(samps = purrr::pmap(.l = map_args, .f = \ (x, y, z) {
-        sample(1:x, size = y, replace = TRUE) + z
-      })) |>
-      dplyr::pull(samps) |>
-      unlist()
+  pop_doms <- setNames(data.frame(pop_dom), dom_nm)
+  pop_counts <- dplyr::count(pop_doms, !!rlang::sym(dom_nm))
+  doms <- pop_counts[[dom_nm]]
+  
+  # domains with no rows in samp (out-of-sample domains) draw 0 rows
+  n_samp <- num_plots$n[match(doms, num_plots[[dom_nm]])]
+  n_samp[is.na(n_samp)] <- 0L
+  
+  rows <- split(seq_along(pop_dom), factor(pop_dom, levels = doms))
+  
+  list(rows = unname(rows),
+       n_pop = pop_counts$n,
+       n_samp = n_samp)
+  
+}
+
+#' Draw stratified bootstrap samples from a population
+#' 
+#' Each sample draws, with replacement, `plan$n_samp` rows from each domain's
+#' population rows. Only the sampled rows are copied, so the cost does not
+#' grow with the population size.
+#' 
+#' @param plan The list returned by `boot_samp_plan()`
+#' @param pop_x A data.frame of population rows (domain and predictor columns)
+#' @param response Optional numeric vector of population responses, added as a
+#' `response` column; NULL if `pop_x` already contains it
+#' @param n_samp Integer. The number of samples to draw
+#' 
+#' @return A list of `n_samp` data.frames
+#' @noRd
+draw_boot_samples <- function(plan, pop_x, response = NULL, n_samp) {
+  
+  lapply(seq_len(n_samp), \(i) {
     
-    out <- pop_ordered[ids, ]
-    all_samps[[i]] <- out
-  }
-  
-  return(all_samps)
+    ids <- unlist(lapply(seq_along(plan$rows), \(d) {
+      plan$rows[[d]][sample.int(plan$n_pop[d], plan$n_samp[d], replace = TRUE)]
+    }))
+    
+    out <- pop_x[ids, , drop = FALSE]
+    if (!is.null(response)) {
+      out$response <- response[ids]
+    }
+    out
+    
+  })
   
 }
 
@@ -373,37 +407,52 @@ boot_pop_setup <- function(original_out,
   pop_doms <- unique(pop_dat[[domain_level]])
   all_doms <- union(pop_doms, zi_mod_coefs$domain_levels)
 
+  dom <- pop_dat[ , domain_level, drop = TRUE]
+
   list(
     coefs = zi_mod_coefs,
     pop_x = pop_dat[ , c(domain_level, all_preds)],
-    dom = pop_dat[ , domain_level, drop = TRUE],
+    dom = dom,
+    dom_idx = match(dom, all_doms),
     all_doms = all_doms,
-    log_fixed = x_matrix[ , c("(Intercept)", log_X)] %*% zi_mod_coefs$alpha_1,
-    lin_fixed = x_matrix[, colnames(model.matrix(original_out$lmer))] %*% zi_mod_coefs$beta_hat
+    log_fixed = as.vector(x_matrix[ , c("(Intercept)", log_X)] %*% zi_mod_coefs$alpha_1),
+    lin_fixed = as.vector(x_matrix[, colnames(model.matrix(original_out$lmer))] %*% zi_mod_coefs$beta_hat)
   )
   
 }
 
 #' Draw one bootstrap population
 #' 
-#' The random draws are made in a fixed order (unit errors, linear domain
-#' effects, logistic domain effects, nonzero indicators), so a single
-#' population drawn after a given seed matches earlier versions of saeczi.
-#' 
 #' @param setup The list returned by `boot_pop_setup()`
 #' 
-#' @return The population bootstrap data
+#' @return The population bootstrap data: the population's domain and
+#' predictor columns plus the drawn `response`
 #' @noRd
 draw_boot_pop <- function(setup) {
   
+  data.frame(setup$pop_x, response = draw_boot_response(setup))
+  
+}
+
+#' Draw the response of one bootstrap population
+#' 
+#' The random draws are made in a fixed order (unit errors, linear domain
+#' effects, logistic domain effects, nonzero indicators), so a population
+#' drawn after a given seed matches earlier versions of saeczi. Only the
+#' response vector is built; the bootstrap does not need a full copy of the
+#' population's predictors for each population.
+#' 
+#' @param setup The list returned by `boot_pop_setup()`
+#' 
+#' @return A numeric vector with one response per population row
+#' @noRd
+draw_boot_response <- function(setup) {
+  
   zi_mod_coefs <- setup$coefs
   
-  eps_ij <- rnorm(length(setup$dom), 0, sqrt(zi_mod_coefs$sig2_eps_hat))
+  eps_ij <- rnorm(length(setup$dom_idx), 0, sqrt(zi_mod_coefs$sig2_eps_hat))
 
-  area_re_lkp <- setNames(
-    rnorm(length(setup$all_doms), 0, sqrt(zi_mod_coefs$sig2_mu_hat)),
-    setup$all_doms
-  )
+  area_re <- rnorm(length(setup$all_doms), 0, sqrt(zi_mod_coefs$sig2_mu_hat))
 
   # Draw a fresh domain random effect for the logistic model from its
   # estimated distribution N(0, sig2_b_hat), the same way u_j is drawn
@@ -413,45 +462,37 @@ draw_boot_pop <- function(setup) {
   # what lets the bootstrap "truth" population reflect the variability the
   # logistic model actually contributes to the domain-level estimates,
   # for in-sample and out-of-sample domains alike.
-  b_i_lkp <- setNames(
-    rnorm(length(setup$all_doms), 0, sqrt(zi_mod_coefs$sig2_b_hat)),
-    setup$all_doms
-  )
+  b_i <- rnorm(length(setup$all_doms), 0, sqrt(zi_mod_coefs$sig2_b_hat))
 
-  x <- setup$log_fixed + b_i_lkp[setup$dom]
-  p_hat_i <- binomial()$linkinv(x)
+  p_hat_i <- binomial()$linkinv(setup$log_fixed + b_i[setup$dom_idx])
   
   delta_i_star <- rbinom(length(p_hat_i), 1, p_hat_i)
   
-  linear_preds <- setup$lin_fixed + area_re_lkp[setup$dom] + eps_ij
-  
-  boot_pop_data <- data.frame(
-    setup$pop_x,
-    response = linear_preds * delta_i_star
-  ) 
-  
-  return(boot_pop_data)
+  (setup$lin_fixed + area_re[setup$dom_idx] + eps_ij) * delta_i_star
   
 }
 
 #' Compute the true domain values of a bootstrap population
 #' 
-#' @param boot_pop_data The bootstrap population data
+#' @param dom The domain of each population row
+#' @param response The bootstrap population's response
 #' @param domain_level Character. Domain identifier name
 #' @param estimand A string specifying whether the estimates should be 'totals' or 'means'
 #' @param inv_transform_fun Function or NULL. Inverse of the response transformation
 #' 
 #' @return A data.frame with one row per domain and a `domain_est` column
 #' @noRd
-compute_boot_truth <- function(boot_pop_data,
+compute_boot_truth <- function(dom,
+                               response,
                                domain_level,
                                estimand,
                                inv_transform_fun) {
   
   if (!is.null(inv_transform_fun)) {
-    boot_pop_data <- boot_pop_data |>
-      mutate(response = inv_transform_fun(response))
+    response <- inv_transform_fun(response)
   }
+  
+  boot_pop_data <- setNames(data.frame(dom, response), c(domain_level, "response"))
   
   agg_fun <- if (estimand == "means") mean else sum
   

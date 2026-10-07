@@ -1,5 +1,21 @@
 # saeczi (development version)
 
+* MSE estimation is much faster for large populations. Each bootstrap
+  population now draws only its response vector instead of building a full
+  copy of the population data, and bootstrap samples are drawn from domain
+  row positions computed once per call instead of re-sorting the whole
+  population for every sample. On a synthetic population of 4 million units
+  in 250 domains (B = 10, `n_boot_pop = 10`), one call took 21 s instead of
+  169 s. Results are identical for the same seed.
+
+* Fixed: bootstrap samples could be drawn from the wrong domain when domain
+  names sort differently in the C locale than in the system locale (for
+  example, names that differ in letter case, such as "a" and "B"). Domains
+  were ordered one way when counting and the other way when sorting rows,
+  so each such domain was sampled from another domain's rows and got
+  another domain's sample size. Domain names made only of digits were not
+  affected.
+
 * Bootstrap refits that fail or warn are now tracked instead of handled
   silently. Previously a refit that errored was dropped from the MSE without
   being counted, and a refit that gave a warning (e.g. a `glmer()`

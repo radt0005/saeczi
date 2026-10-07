@@ -215,24 +215,26 @@ saeczi <- function(samp_dat,
     boot_lin_formula <- reformulate(c(lin_X, rand_intercept), "response")
     boot_log_formula <- reformulate(c(log_X, rand_intercept), "response != 0")
 
-    # Draws one bootstrap population, computes its truth, and draws n_samp
-    # bootstrap samples from it. The population is then discarded, so only
-    # one population is held in memory at a time.
+    # Draws one bootstrap population's response, computes its truth, and
+    # draws n_samp bootstrap samples from it. The response is then discarded,
+    # so only one population is held in memory at a time.
     # Population time (draw and truth) and sampling time are recorded
     # separately, because sampling cost grows with the number of replicates,
     # not the number of populations.
+    samp_plan <- boot_samp_plan(samp_dat, pop_setup$dom, domain_level)
     pop_times <- numeric(0)
     samp_time <- 0
     boot_truth <- list()
     draw_pop_and_samples <- function(n_samp) {
       t0 <- proc.time()[["elapsed"]]
-      boot_pop_data <- draw_boot_pop(pop_setup)
-      boot_truth[[length(boot_truth) + 1]] <<- compute_boot_truth(boot_pop_data,
+      response <- draw_boot_response(pop_setup)
+      boot_truth[[length(boot_truth) + 1]] <<- compute_boot_truth(pop_setup$dom,
+                                                                  response,
                                                                   domain_level,
                                                                   estimand,
                                                                   inv_transform_fun)
       t1 <- proc.time()[["elapsed"]]
-      samps <- samp_by_grp(samp_dat, boot_pop_data, domain_level, n_samp)
+      samps <- draw_boot_samples(samp_plan, pop_setup$pop_x, response, n_samp)
       pop_times <<- c(pop_times, t1 - t0)
       samp_time <<- samp_time + proc.time()[["elapsed"]] - t1
       samps
